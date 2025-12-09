@@ -21,3 +21,499 @@ data_ts = df[['Date', 'Oil (BBL)']].copy().set_index('Date').sort_index()
 data_ts_clean = data_ts[data_ts['Oil (BBL)'] > 0].copy()
 
 print("Datos cargados. Total de registros limpios:", len(data_ts_clean))
+
+# ----------------------------------------------------------------------
+# 2. VISUALIZACIÓN DE LA SERIE DE TIEMPO COMPLETA
+# ----------------------------------------------------------------------
+
+plt.figure(figsize=(14, 6))
+plt.plot(data_ts_clean.index, data_ts_clean['Oil (BBL)'], 
+         label='Producción de Petróleo (BBL/mes)', color='green', linewidth=1.5)
+plt.fill_between(data_ts_clean.index, data_ts_clean['Oil (BBL)'], color='green', alpha=0.2)
+plt.title('Producción de Petróleo vs. Tiempo ')
+plt.xlabel('Fecha')
+plt.ylabel('Petróleo (BBL/mes)')
+plt.legend()
+plt.grid(True, which='both', linestyle='--', linewidth=0.5)
+plt.show()
+
+# ----------------------------------------------------------------------
+# 3. IDENTIFICACIÓN Y VISUALIZACIÓN DE OUTLIERS (BOXPLOT)
+# ----------------------------------------------------------------------
+
+# Se utiliza un Boxplot para visualizar la distribución y los valores atípicos
+# La media es arrastrada por el pico, lo que hace que casi todos los puntos parezcan outliers.
+plt.figure(figsize=(8, 6))
+plt.boxplot(data_ts_clean['Oil (BBL)'].values, vert=False, patch_artist=True, 
+            boxprops=dict(facecolor='lightblue'))
+plt.title('Identificación de Outliers (Pico de Producción)')
+plt.xlabel('Petróleo (BBL/mes)')
+plt.yticks([1], ['Producción'])
+plt.grid(True, which='major', linestyle='--', linewidth=0.5)
+plt.show()
+
+############################################# ARPS ############################################
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.optimize import curve_fit
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.metrics import r2_score, mean_squared_error
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense, Dropout, Conv1D
+from tensorflow.keras.callbacks import EarlyStopping
+
+# --- Funciones Esenciales ---
+def arps_hyperbolic(t, qi, Di, b):
+    if b < 1e-6:
+        return qi * np.exp(-Di * t)
+    return qi / (1 + b * Di * t)**(1/b)
+
+def mape(y_true, y_pred):
+    epsilon = 1e-10 
+    return np.mean(np.abs((y_true - y_pred) / (y_true + epsilon))) * 100
+
+# ----------------------------------------------------------------------
+# 4.1. PREPARACIÓN DE DATOS Y AJUSTE BASE DE ARPS
+# ----------------------------------------------------------------------
+# (Re-carga y pre-procesamiento para asegurar que todas las variables existan)
+df = pd.read_excel('alberta.xlsx')
+df['Date'] = pd.to_datetime(df['Date'])
+data_ts = df[['Date', 'Oil (BBL)']].copy().set_index('Date').sort_index()
+data_ts_clean = data_ts[data_ts['Oil (BBL)'] > 0].copy()
+data_stable_decline = data_ts_clean.iloc[50:].copy() # Segmentación de la fase estable
+production_data_original = data_stable_decline['Oil (BBL)'].values
+N_total = len(production_data_original)
+train_len = int(N_total * 0.8) 
+t_total = np.arange(N_total)
+y_train = production_data_original[:train_len]
+y_test = production_data_original[train_len:]
+t_test = t_total[train_len:]
+initial_qi = y_train[0]
+popt, pcov = curve_fit(arps_hyperbolic, t_train, y_train, p0=[initial_qi, 0.1, 0.5], bounds=([initial_qi * 0.5, 0.001, 0.0], [initial_qi * 1.5, 2.0, 0.99]))
+qi_opt, Di_opt, b_opt = popt
+# Pronóstico de Arps Puro (Baseline)
+arps_forecast_test = arps_hyperbolic(t_test, qi_opt, Di_opt, b_opt)
+arps_history_forecast = arps_hyperbolic(t_total, qi_opt, Di_opt, b_opt)
+
+########################## TRATAMIENTO DE LOS RESIDUALES DEL PRONOSTICO DE ARPS ###############################
+residual_values = (production_data_original - arps_history_forecast).reshape(-1, 1)
+scaler_res = MinMaxScaler(feature_range=(0, 1))
+scaled_residual_data = scaler_res.fit_transform(residual_values)
+train_data_scaled_res = scaled_residual_data[:train_len]
+SEQ_LENGTH = 12 
+
+# Definición de Secuencias para Redes Neuronales
+def create_sequences_single_step(data, seq_length, is_dense=False):
+    X, y = [], []
+    for i in range(len(data) - seq_length - 1):
+        if is_dense:
+             X.append(data[i:(i + seq_length)].flatten())
+        else:
+             X.append(data[i:(i + seq_length)])
+        y.append(data[i + seq_length, 0])
+    return np.array(X), np.array(y)
+
+# Función Auxiliar para Pronóstico Iterativo
+def iterative_forecast(model, X_initial, scaler, arps_forecast, seq_length, is_dense=False):
+    forecast_steps = len(arps_forecast)
+    predicted_residual_scaled = []
+    current_batch = X_initial.copy()
+
+    for i in range(forecast_steps):
+        prediction = model.predict(current_batch, verbose=0)
+        current_prediction = prediction[0, 0] if not is_dense else prediction[0]
+        predicted_residual_scaled.append(current_prediction)
+        if is_dense:
+            new_input = np.delete(current_batch[0], 0) 
+            current_batch = np.append(new_input, current_prediction).reshape(1, seq_length)
+        else:
+            new_input = np.delete(current_batch[0], 0, axis=0) 
+            current_batch = np.append(new_input, [[current_prediction]]).reshape(1, seq_length, 1)
+
+    predicted_residual = scaler.inverse_transform(np.array(predicted_residual_scaled).reshape(-1, 1))
+    return arps_forecast.reshape(-1, 1) + predicted_residual
+
+# Variables globales para la tabla final
+global y_test_final, test_index_dates_final, arps_forecast_pure, history_lstm, history_dense, history_cnn_lstm
+y_test_final = y_test.flatten()
+test_index_dates_final = data_stable_decline.index[train_len:][:len(y_test)]
+arps_forecast_pure = arps_forecast_test.flatten()
+
+# --- Definición del Early Stopping ( control de sobreajuste) ---
+early_stop = EarlyStopping(monitor='val_loss', patience=25, restore_best_weights=True)
+
+
+# ----------------------------------------------------------------------
+# 4.2. MODELO HÍBRIDO: LSTM SIMPLE (Guarda en history_lstm)
+# ----------------------------------------------------------------------
+X_train_lstm, y_train_lstm = create_sequences_single_step(train_data_scaled_res, SEQ_LENGTH)
+X_train_lstm = X_train_lstm.reshape(X_train_lstm.shape[0], X_train_lstm.shape[1], 1)
+X_initial_lstm = train_data_scaled_res[-SEQ_LENGTH:].reshape(1, SEQ_LENGTH, 1)
+
+model_lstm = Sequential([
+    LSTM(100, return_sequences=False, input_shape=(SEQ_LENGTH, 1)), 
+    Dropout(0.2),
+    Dense(1)
+])
+model_lstm.compile(optimizer='adam', loss='mean_squared_error')
+history_lstm = model_lstm.fit(X_train_lstm, y_train_lstm, epochs=300, batch_size=16, validation_split=0.1, verbose=0) 
+global hybrid_forecast_LSTM
+hybrid_forecast_LSTM = iterative_forecast(model_lstm, X_initial_lstm, scaler_res, arps_forecast_test, SEQ_LENGTH).flatten()
+
+print("LSTM Simple - **OK**")
+
+# ----------------------------------------------------------------------
+# 4.3. MODELO HÍBRIDO: RED DENSA (Guarda en history_dense)
+# ----------------------------------------------------------------------
+X_train_dense, y_train_dense = create_sequences_single_step(train_data_scaled_res, SEQ_LENGTH, is_dense=True)
+X_initial_dense = train_data_scaled_res[-SEQ_LENGTH:].flatten().reshape(1, SEQ_LENGTH)
+
+model_dense = Sequential([
+    Dense(100, activation='relu', input_shape=(SEQ_LENGTH,)), 
+    Dropout(0.2),
+    Dense(50, activation='relu'),
+    Dropout(0.2),
+    Dense(1)
+])
+model_dense.compile(optimizer='adam', loss='mean_squared_error')
+history_dense = model_dense.fit(X_train_dense, y_train_dense, epochs=300, batch_size=16, validation_split=0.1, verbose=0)
+global hybrid_forecast_Dense
+hybrid_forecast_Dense = iterative_forecast(model_dense, X_initial_dense, scaler_res, arps_forecast_test, SEQ_LENGTH, is_dense=True).flatten()
+
+print("Red Densa - **OK**")
+
+# ----------------------------------------------------------------------
+# 4.4. MODELO HÍBRIDO: CNN-LSTM (Guarda en history_cnn_lstm)
+# ----------------------------------------------------------------------
+X_train_cnn_lstm, y_train_cnn_lstm = create_sequences_single_step(train_data_scaled_res, SEQ_LENGTH)
+X_train_cnn_lstm = X_train_cnn_lstm.reshape(X_train_cnn_lstm.shape[0], X_train_cnn_lstm.shape[1], 1)
+X_initial_cnn_lstm = train_data_scaled_res[-SEQ_LENGTH:].reshape(1, SEQ_LENGTH, 1)
+
+model_cnn_lstm = Sequential([
+    Conv1D(filters=64, kernel_size=2, activation='relu', input_shape=(SEQ_LENGTH, 1)),
+    Dropout(0.2),
+    LSTM(50, return_sequences=False),
+    Dropout(0.2),
+    Dense(1)
+])
+model_cnn_lstm.compile(optimizer='adam', loss='mean_squared_error')
+history_cnn_lstm = model_cnn_lstm.fit(X_train_cnn_lstm, y_train_cnn_lstm, epochs=100, batch_size=16, validation_split=0.1, verbose=0)
+global hybrid_forecast_CNN_LSTM
+hybrid_forecast_CNN_LSTM = iterative_forecast(model_cnn_lstm, X_initial_cnn_lstm, scaler_res, arps_forecast_test, SEQ_LENGTH).flatten()
+
+print("CNN-LSTM - **OK**")
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.metrics import r2_score, mean_squared_error
+# (Asume que todas las variables globales y de pronóstico están cargadas)
+
+# --- Funciones Esenciales ---
+def mape(y_true, y_pred):
+    epsilon = 1e-10 
+    return np.mean(np.abs((y_true - y_pred) / (y_true + epsilon))) * 100
+
+# ----------------------------------------------------------------------
+# 5.1. GRÁFICAS DE PÉRDIDA (LOSS) PARA DIAGNÓSTICO DE AJUSTE
+# ----------------------------------------------------------------------
+
+def plot_loss(history, title):
+    plt.figure(figsize=(8, 5))
+    plt.plot(history.history['loss'], label='Pérdida de Entrenamiento', color='blue')
+    plt.plot(history.history['val_loss'], label='Pérdida de Validación', color='red')
+    plt.title(f'Diagnóstico de Ajuste: {title}')
+    plt.xlabel('Época')
+    plt.ylabel('Pérdida (MSE)')
+    plt.legend()
+    plt.grid(True)
+    plt.show()
+
+# Ejecutar las gráficas
+plot_loss(history_lstm, "LSTM Simple")
+plot_loss(history_dense, "Red Densa")
+plot_loss(history_cnn_lstm, "CNN-LSTM")
+
+
+# ----------------------------------------------------------------------
+# 5.2. TABLAS Y GRÁFICO CONSOLIDADO (Igual que en el script anterior)
+# ----------------------------------------------------------------------
+
+# DataFrame de Valores
+final_df = pd.DataFrame({
+    'Fecha': test_index_dates_final,
+    'Producción Real': y_test_final,
+    'Pronóstico Arps Puro': arps_forecast_pure,
+    'Pronóstico LSTM': hybrid_forecast_LSTM,
+    'Pronóstico Red Densa': hybrid_forecast_Dense,
+    'Pronóstico CNN-LSTM': hybrid_forecast_CNN_LSTM
+})
+final_df = final_df.set_index('Fecha')
+final_df = final_df.round(2)
+
+# DataFrame de Métricas
+def calculate_metrics(y_true, y_pred):
+    return {
+        'R2': r2_score(y_true, y_pred),
+        'RMSE': np.sqrt(mean_squared_error(y_true, y_pred)),
+        'MAPE': mape(y_true, y_pred)
+    }
+
+metrics = {
+    'Arps Puro': calculate_metrics(y_test_final, final_df['Pronóstico Arps Puro'].values),
+    'Híbrido LSTM': calculate_metrics(y_test_final, final_df['Pronóstico LSTM'].values),
+    'Híbrido Red Densa': calculate_metrics(y_test_final, final_df['Pronóstico Red Densa'].values),
+    'Híbrido CNN-LSTM': calculate_metrics(y_test_final, final_df['Pronóstico CNN-LSTM'].values),
+}
+
+metrics_df = pd.DataFrame(metrics).T
+metrics_df['RMSE'] = metrics_df['RMSE'].round(2)
+metrics_df['MAPE'] = metrics_df['MAPE'].round(2)
+metrics_df['R2'] = metrics_df['R2'].round(4)
+metrics_df.columns = ['R2', 'RMSE (BBL/mes)', 'MAPE (%)']
+
+print("\n----------------------------------------------------------")
+print("⭐ **Tabla de Métricas de Rendimiento Final**")
+print("----------------------------------------------------------")
+print(metrics_df.to_markdown(floatfmt=".4f"))
+
+print("\n----------------------------------------------------------")
+print("📊 **Tabla Comparativa de Pronósticos (Valores BBL/mes)**")
+print("----------------------------------------------------------")
+print(final_df.to_markdown(floatfmt=".2f"))
+
+# Gráfico Consolidado
+plt.figure(figsize=(16, 8))
+plt.plot(final_df.index, final_df['Producción Real'], 
+         label='1. Producción Real (Test)', color='blue', linewidth=3)
+plt.plot(final_df.index, final_df['Pronóstico Arps Puro'], 
+         label='2. Pronóstico Arps Puro (Baseline)', color='orange', linestyle=':', linewidth=2)
+plt.plot(final_df.index, final_df['Pronóstico LSTM'], 
+         label='3. Híbrido LSTM', color='green', linestyle='--', linewidth=2)
+plt.plot(final_df.index, final_df['Pronóstico Red Densa'], 
+         label='4. Híbrido Red Densa', color='darkcyan', linestyle='-.', linewidth=2)
+plt.plot(final_df.index, final_df['Pronóstico CNN-LSTM'], 
+         label='5. Híbrido CNN-LSTM', color='red', linestyle='-', linewidth=1.5)
+
+plt.title('Comparación Final de Modelos de Declinación vs. Producción Real')
+plt.xlabel('Fecha')
+plt.ylabel('Petróleo (BBL/mes)')
+plt.legend()
+plt.grid(True)
+plt.xticks(rotation=45)
+plt.tight_layout()
+plt.show()
+
+
+# ----------------------------------------------------------------------
+# 5.3. PARÁMETROS DE CADA MODELO (PESOS Y SESGOS)
+# ----------------------------------------------------------------------
+
+def print_model_params(model, name):
+    print(f"\n--- Parámetros del Modelo: {name} ---")
+    weights = model.get_weights()
+    for i, w in enumerate(weights):
+        print(f"  Capa {i+1} - Peso/Sesgo: {w.shape}")
+        print(f"  > Norma L2 del tensor: {np.linalg.norm(w):.4f}")
+        if w.ndim > 1:
+            print(f"  > Primeros 5 valores (Pesos): {w.flatten()[:5]}")
+        else:
+             print(f"  > Primeros 5 valores (Sesgos): {w.flatten()[:5]}")
+
+print_model_params(model_lstm, "Híbrido LSTM Simple")
+print_model_params(model_dense, "Híbrido Red Densa")
+print_model_params(model_cnn_lstm, "Híbrido CNN-LSTM")
+
+# ----------------------------------------------------------------------
+# 6.1. ARQUITECTURA DE LAS REDES NEURONALES
+# ----------------------------------------------------------------------
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+# Asegúrese de que las variables model_lstm, model_dense, y model_cnn_lstm estén definidas
+# Ejecute este código DESPUÉS del script de Modelado (Punto 4)
+
+def print_model_summary(model, name):
+    """
+    Imprime un encabezado y luego el resumen de la arquitectura del modelo
+    utilizando model.summary() de Keras.
+    """
+    print("\n" + "="*80)
+    print(f"--- RESUMEN DE ARQUITECTURA: {name} ---")
+    print("="*80)
+    model.summary()
+    print("\n")
+
+
+# 1. Resumen de la Red LSTM Simple
+print_model_summary(model_lstm, "Híbrido LSTM Simple")
+
+# 2. Resumen de la Red Densa
+print_model_summary(model_dense, "Híbrido Red Densa (Fully Connected)")
+
+# 3. Resumen de la Red CNN-LSTM
+print_model_summary(model_cnn_lstm, "Híbrido CNN-LSTM (Convolucional)")
+
+# ----------------------------------------------------------------------
+# 7.1. VISUALIZACIÓN DE LA DIVISIÓN DEL SET DE DATOS
+# ----------------------------------------------------------------------
+# 1. Segmentación de la fase estable (Remoción de outliers iniciales)
+data_stable_decline = data_ts_clean.iloc[50:].copy() 
+production_data_original = data_stable_decline['Oil (BBL)'].values
+
+# 2. Definición de la División 80/20
+N_total = len(production_data_original)
+train_len = int(N_total * 0.8) # 80% para entrenamiento
+
+# 3. Separación de los conjuntos (Indices y Valores)
+train_data_indices = data_stable_decline.index[:train_len]
+test_data_indices = data_stable_decline.index[train_len:]
+
+train_data_values = production_data_original[:train_len]
+test_data_values = production_data_original[train_len:]
+
+# 4. Generación de la Gráfica
+plt.figure(figsize=(16, 6))
+plt.plot(train_data_indices, train_data_values, 
+         label=f'Conjunto de Entrenamiento (Train: {train_len} meses)', 
+         color='blue', linewidth=2)
+plt.plot(test_data_indices, test_data_values, 
+         label=f'Conjunto de Prueba (Test: {N_total - train_len} meses)', 
+         color='red', linewidth=2)
+
+# Añadir una línea vertical para indicar el punto de división
+plt.axvline(x=test_data_indices[0], color='black', linestyle='--', linewidth=1, 
+            label='Punto de División (Fin de Entrenamiento)')
+
+plt.title('División de la Serie de Tiempo Estable (Train vs. Test)')
+plt.xlabel('Fecha')
+plt.ylabel('Petróleo (BBL/mes)')
+plt.legend()
+plt.grid(True, linestyle=':', alpha=0.7)
+plt.show()
+
+# ----------------------------------------------------------------------
+# 8.1. VISUALIZACIÓN SET DE DATOS VS ARPS
+# ----------------------------------------------------------------------
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+
+# --- Asumiendo que las variables de Arps y los datos están cargados ---
+# (Definidas en el script de modelado, Punto 4)
+# data_stable_decline, production_data_original, t_total, qi_opt, Di_opt, b_opt
+
+def arps_hyperbolic(t, qi, Di, b):
+    # Ecuación de declinación hiperbólica de Arps
+    if b < 1e-6:
+        return qi * np.exp(-Di * t)
+    return qi / (1 + b * Di * t)**(1/b)
+
+# 1. Generar la Curva de Arps para el periodo completo (Train + Test)
+arps_curve_full = arps_hyperbolic(t_total, qi_opt, Di_opt, b_opt)
+
+# 2. Generación de la Gráfica
+plt.figure(figsize=(16, 6))
+
+# A. Producción Real (Datos Estables Segmentados)
+plt.plot(data_stable_decline.index, production_data_original, 
+         label='Producción Real (Datos Estables)', 
+         color='blue', linewidth=2)
+
+# B. Curva de Ajuste de Arps (Modelo Teórico)
+plt.plot(data_stable_decline.index, arps_curve_full, 
+         label=f'Ajuste de Arps: qi={qi_opt:.2f}, Di={Di_opt:.4f}, b={b_opt:.4f}', 
+         color='orange', linestyle='--', linewidth=3)
+
+plt.title('Ajuste del Modelo de Declinación de Arps vs. Producción Real (Fase Estable)')
+plt.xlabel('Fecha')
+plt.ylabel('Petróleo (BBL/mes)')
+plt.legend()
+plt.grid(True, linestyle=':', alpha=0.7)
+plt.show()
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+# Asegúrese de que las variables globales ya estén definidas por el script de modelado (Punto 4)
+# Variables requeridas: y_test_final, test_index_dates_final, arps_forecast_pure
+
+# 1. Generación de la Gráfica de Comparación de la Zona de Prueba
+plt.figure(figsize=(12, 6))
+
+# A. Producción Real (Conjunto de Prueba)
+plt.plot(test_index_dates_final, y_test_final, 
+         label='Producción Real (Test Set)', 
+         color='blue', linewidth=2.5)
+
+# B. Pronóstico Base (Arps Puro)
+plt.plot(test_index_dates_final, arps_forecast_pure, 
+         label='Pronóstico Arps Puro (Baseline)', 
+         color='orange', linestyle=':', linewidth=3)
+
+plt.title('Comparación: Producción Real vs. Pronóstico Arps Puro (Conjunto de Prueba)')
+plt.xlabel('Fecha')
+plt.ylabel('Petróleo (BBL/mes)')
+plt.legend()
+plt.grid(True, linestyle='--', alpha=0.7)
+plt.xticks(rotation=45)
+plt.tight_layout()
+plt.show()
+
+# ----------------------------------------------------------------------
+# 9.1. VISUALIZACIÓN DE LOS ACUMULADOS DE PRODICCIÓN
+# ----------------------------------------------------------------------
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+
+# --- Asumiendo que las variables globales de pronóstico están cargadas ---
+# Variables requeridas: 
+# y_test_final, test_index_dates_final, 
+# hybrid_forecast_LSTM, hybrid_forecast_Dense, hybrid_forecast_CNN_LSTM, arps_forecast_pure
+
+# 1. Crear DataFrame con las series de tiempo del conjunto de prueba
+test_forecast_df = pd.DataFrame({
+    'Fecha': test_index_dates_final,
+    'Producción Real': y_test_final,
+    'Pronóstico Arps Puro': arps_forecast_pure,
+    'Pronóstico LSTM': hybrid_forecast_LSTM,
+    'Pronóstico Red Densa': hybrid_forecast_Dense,
+    'Pronóstico CNN-LSTM': hybrid_forecast_CNN_LSTM
+}).set_index('Fecha')
+
+# 2. Calcular la Producción Acumulada (Cumulative Sum) para cada columna
+cumulative_production_df = test_forecast_df.cumsum()
+
+# 3. Generación de la Tabla de Producción Acumulada
+print("\n" + "="*80)
+print("⭐ TABLA DE PRODUCCIÓN ACUMULADA (BBL) EN EL CONJUNTO DE PRUEBA")
+print("="*80)
+print(cumulative_production_df.round(2).to_markdown())
+
+
+# 4. Generación de la Gráfica de Producción Acumulada
+plt.figure(figsize=(12, 6))
+
+plt.plot(cumulative_production_df.index, cumulative_production_df['Producción Real'], 
+         label='1. Producción Real Acumulada', color='blue', linewidth=3)
+plt.plot(cumulative_production_df.index, cumulative_production_df['Pronóstico Arps Puro'], 
+         label='2. Pronóstico Arps Puro', color='orange', linestyle=':', linewidth=2)
+plt.plot(cumulative_production_df.index, cumulative_production_df['Pronóstico LSTM'], 
+         label='3. Híbrido LSTM', color='green', linestyle='--', linewidth=2)
+plt.plot(cumulative_production_df.index, cumulative_production_df['Pronóstico Red Densa'], 
+         label='4. Híbrido Red Densa', color='darkcyan', linestyle='-.', linewidth=2)
+plt.plot(cumulative_production_df.index, cumulative_production_df['Pronóstico CNN-LSTM'], 
+         label='5. Híbrido CNN-LSTM', color='red', linestyle='-', linewidth=1.5)
+
+plt.title('Comparación de la Producción Acumulada (Conjunto de Prueba)')
+plt.xlabel('Fecha')
+plt.ylabel('Petróleo Acumulado (BBL)')
+plt.legend(loc='upper left')
+plt.grid(True)
+plt.xticks(rotation=45)
+plt.tight_layout()
+plt.show()
+
+
